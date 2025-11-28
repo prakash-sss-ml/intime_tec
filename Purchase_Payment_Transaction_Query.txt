@@ -1,0 +1,19 @@
+SELECT Company.mserp_name Corporate Code, Company.mserp_description Corporate Name, Company.mserp_accountingcurrency,
+VendTrans.mserp_accountnum Vendor Code, VendTrans.mserp_currencycode Currency,
+VendTrans.mserp_amountcur Purchase Payment Amount_Foreign Currency, VendTrans.mserp_amountmst Purchase Payment Amount_KRW,    --Negative: Purchase, Positive: Payment
+(VendTrans.mserp_amountcur - VendTrans.mserp_settleamountcur) Purchase Payment Balance_Foreign Currency, (VendTrans.mserp_amountmst - VendTrans.mserp_settleamountmst) Purchase Payment Balance_KRW,
+VendTrans.mserp_transdate Transaction Date, VendTrans.mserp_duedate Due Date, VendTrans.mserp_closed Settlement Date,      --If settlement date exists, closed purchase...i.e., balance is ZERO
+DirPartyTable.mserp_name Vendor Name
+FROM DBO.mserp_ledgerbientity Company                           --Corporate Master
+JOIN DBO.mserp_vendtransbientity VendTrans                      --Purchase/Payment Transactions
+    ON VendTrans.mserp_dataareaid = Company.mserp_name
+        --AND VendTrans.mserp_dataareaid = 'usmf'
+        --AND VendTrans.mserp_accountnum = ‘us-102’
+JOIN DBO.mserp_vendtablebientity VendTable                      --Vendor Master
+    ON VendTable.mserp_accountnum = VendTrans.mserp_accountnum
+    --AND VendTable.mserp_dataareaid = Company.mserp_name
+    
+JOIN DBO.mserp_dirpartytablebientity DirPartyTable              --Address Book Master
+    ON DirPartyTable.mserp_sourcekey = VendTable.mserp_party
+
+WHERE Company.mserp_name <> N'DAT'  --Exclude System Entities

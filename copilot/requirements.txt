@@ -1,0 +1,9 @@
+openai
+msal
+requests
+python-dotenv
+pandas
+langchain_openai
+langchain_experimental
+tabulate
+matplotlib
