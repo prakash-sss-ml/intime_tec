@@ -1,844 +1,1257 @@
 import os
-import requests
+import logging
+import sqlite3
+from datetime import date, timedelta
+from typing import Optional, Tuple, Dict, Any
+import json
+import urllib.parse
+
 import msal
 import pandas as pd
-import sqlite3
-from fastapi import FastAPI
-from pydantic import BaseModel
+import requests
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from urllib.parse import quote
 from openai import AzureOpenAI
-from datetime import datetime, timedelta
-import logging
+from functools import lru_cache
+import time
 
-# =====================================================
-# Logging Setup
-# =====================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="\n==== LOG | %(asctime)s | %(levelname)s ====\n%(message)s\n",
-)
-logger = logging.getLogger("payables_backend")
+CACHE_TTL = 3600  # cache for 5 minutes
+_last_load_time = 0
+_cached_connection = None
 
-# =====================================================
-# Load Environment Variables
-# =====================================================
+# ------------------------------------------------------
+# Load ENV
+# ------------------------------------------------------
 load_dotenv()
 
+# ------------------------------------------------------
+# Logging
+# ------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------
+# ENV CONFIG
+# ------------------------------------------------------
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 DATAVERSE_URL = os.getenv("DATAVERSE_URL")
 
-TABLE_COMPANY = os.getenv("TABLE_COMPANY")
-TABLE_VENDTRANS = os.getenv("TABLE_VENDTRANS")
-TABLE_VENDTABLE = os.getenv("TABLE_VENDTABLE")
-TABLE_PARTYTABLE = os.getenv("TABLE_PARTYTABLE")
+TABLE_COMPANY = os.getenv("TABLE_COMPANY", "mserp_ledgerbientities")
+TABLE_VENDTRANS = os.getenv("TABLE_VENDTRANS", "mserp_vendtransbientity")
+TABLE_VENDTABLE = os.getenv("TABLE_VENDTABLE", "mserp_vendtablebientity")
+TABLE_PARTYTABLE = os.getenv("TABLE_PARTYTABLE", "mserp_dirpartytablebientity")
 
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
 
-client_aoai = AzureOpenAI(
+if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET, DATAVERSE_URL,
+            AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY]):
+    logger.warning("Some required environment variables are missing.")
+
+# ------------------------------------------------------
+# Azure OpenAI client
+# ------------------------------------------------------
+aoai_client = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
     api_version=AZURE_OPENAI_API_VERSION,
     azure_endpoint=AZURE_OPENAI_ENDPOINT,
 )
 
-# =====================================================
-# Authenticate to Dataverse
-# =====================================================
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-SCOPE = [f"{DATAVERSE_URL}/.default"]
+# ------------------------------------------------------
+# Intent + Month Classifier (UPDATED WITH NEW SCENARIOS + ROBUST JSON)
+# ------------------------------------------------------
+def build_trend_html_table(df):
+    """
+    Builds a clean, spacious HTML table for purchasing/payment trend.
+    Compatible with Copilot Studio and Outlook-style renderers.
+    """
 
-logger.info("Authenticating to Dataverse via MSAL...")
-msal_app = msal.ConfidentialClientApplication(
-    CLIENT_ID,
-    authority=AUTHORITY,
-    client_credential=CLIENT_SECRET,
-)
+    def fmt(v):
+        """Format numbers into K/M for display."""
+        v = float(v)
+        if abs(v) >= 1_000_000:
+            return f"{v/1_000_000:.2f}M"
+        elif abs(v) >= 1_000:
+            return f"{v/1_000:.2f}K"
+        return f"{v:.2f}"
 
-token_result = msal_app.acquire_token_for_client(scopes=SCOPE)
-if "access_token" not in token_result:
-    logger.error(f"Token fetch failed: {token_result}")
-    raise Exception("Token fetch failed", token_result)
+    # Start table
+    html = """
+<b>Your trend data:</b><br><br>
 
-ACCESS_TOKEN = token_result["access_token"]
-logger.info("✅ Access token acquired successfully.")
+<table border="1" cellpadding="10" cellspacing="0"
+       style="border-collapse: collapse; text-align: left; width:100%; font-size:14px;">
+<tr>
+    <th style="padding: 10px; min-width:140px;">Month</th>
+    <th style="padding: 10px; min-width:160px;">Purchases</th>
+    <th style="padding: 10px; min-width:160px;">Payments</th>
+</tr>
+"""
 
-HEADERS = {
-    "Authorization": f"Bearer {ACCESS_TOKEN}",
-    "Accept": "application/json",
-}
+    # Add rows
+    for _, row in df.iterrows():
+        month = row.get("month", "")
+        purchases = fmt(row.get("purchases", 0))
+        payments = fmt(row.get("payments", 0))
 
-# =====================================================
-# Fetch all Dataverse Pages
-# =====================================================
-def fetch_all(url: str):
-    logger.info(f"Fetching data from Dataverse: {url}")
+        html += f"""
+<tr>
+    <td style="padding: 10px;">{month}</td>
+    <td style="padding: 10px;">{purchases}</td>
+    <td style="padding: 10px;">{payments}</td>
+</tr>
+"""
+
+    html += "</table><br><br>"
+
+    return html
+def build_html_table_generic(table_data: list):
+    """
+    Dynamically builds an HTML table for any table data (any columns).
+    """
+    if not table_data:
+        return ""
+
+    # extract column names
+    columns = table_data[0].keys()
+
+    html = """
+<b>Your data:</b><br><br>
+<table border="1" cellpadding="8" cellspacing="0"
+       style="border-collapse: collapse; text-align: left; width:100%; font-size:14px;">
+<tr>
+"""
+    for col in columns:
+        html += f"<th style='padding:8px'>{col}</th>"
+    html += "</tr>"
+
+    for row in table_data:
+        html += "<tr>"
+        for col in columns:
+            html += f"<td style='padding:8px'>{row[col]}</td>"
+        html += "</tr>"
+
+    html += "</table><br><br>"
+
+    return html
+
+
+
+def classify_with_llm(query: str) -> Tuple[str, Optional[str]]:
+    """
+    LLM classifier:
+      - Maps ANY payables question to a scenario
+      - Extracts a month if present (YYYY-MM) or null
+      - Robust JSON parsing (handles ```json blocks, extra text, etc.)
+    """
+
+    today = date.today()
+    system_msg = f"""
+You are an intent classifier for a payables analytics engine.
+Today is {today.isoformat()}.
+
+You MUST return ONLY a JSON object.
+STRICT RULES:
+- Output must start with '{{' and end with '}}'
+- NO explanations, NO markdown, NO code fences
+- JSON keys must be exactly: "scenario" and "month".
+
+JSON FORMAT:
+{{
+  "scenario": "<one of the allowed scenarios>",
+  "month": "<YYYY-MM or null>"
+}}
+
+Allowed scenarios:
+  - aging                  (vendor aging buckets)
+  - aging_vendor           (same as aging; vendor-wise)
+  - trend                  (6-month purchasing & payment trend)
+  - expected               (expected payments THIS WEEK)
+  - expected_month         (expected payments for a specific month or 'this month')
+  - expected_company       (expected payments THIS WEEK, company & vendor-wise)
+  - expected_company_month (expected payments for a specific month or 'this month', company & vendor-wise)
+  - outstanding_current    (outstanding payments for the CURRENT month)
+  - outstanding_month      (outstanding payments for a specific month, e.g. July 2025)
+  - total_payables_vendor  (total payables by vendor)
+  - top_customers          (top customers by transaction amount, overall or for a month)
+  - vendor_summary         (invoices, payments, net balance per vendor)
+  - balance_by_vendor      (net balance per vendor)
+  - outstanding_vendor_wise (outstanding totals per vendor, no aging buckets)
+
+Month extraction rules:
+- If user says "this month", "current month", map to:
+    * outstanding_current (no month value needed) for OUTSTANDING questions
+    * expected_month with month = current YYYY-MM for EXPECTED questions
+- If user mentions a specific month name (jan, feb, march, july, etc.)
+  or "for July 2024", "in March 2023":
+    → use scenario:
+       * outstanding_month for OUTSTANDING questions
+       * expected_month / expected_company_month for EXPECTED questions
+       * top_customers for TOP queries
+    → set "month" to that calendar month in "YYYY-MM".
+- If user asks about "this week", "current week":
+    → use "expected" or "expected_company" for expected payments.
+    → "month" should be null.
+- If no month is mentioned and no 'this month' context:
+    → "month": null.
+
+VERY IMPORTANT:
+- Do NOT invent new scenario names.
+- Scenario must be EXACTLY one of the allowed ones.
+- For example:
+    "top customers in January" → {{ "scenario": "top_customers", "month": "2025-01" }}
+    "outstanding for July 2023" → {{ "scenario": "outstanding_month", "month": "2023-07" }}
+    "expected payments for this month by company" → {{ "scenario": "expected_company_month", "month": "<current YYYY-MM>" }}
+    "expected vendor payments this week" → {{ "scenario": "expected", "month": null }}
+
+Output ONLY the JSON. No extra text.
+"""
+
+    try:
+        resp = aoai_client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": query},
+            ],
+            max_tokens=120,
+            temperature=0,
+        )
+
+        raw = resp.choices[0].message.content or ""
+        logger.info("Classifier LLM raw output: %s", raw)
+
+        raw = raw.strip()
+
+        # Handle ```json ... ``` or ``` ... ```
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "")
+            raw = raw.replace("```", "")
+            raw = raw.strip()
+
+        # Keep only content between first '{' and last '}'
+        first = raw.find("{")
+        last = raw.rfind("}")
+        if first != -1 and last != -1:
+            raw = raw[first:last+1].strip()
+
+        # Parse JSON
+        result = json.loads(raw)
+
+        scenario = result.get("scenario")
+        month = result.get("month")
+
+        allowed = {
+            "aging",
+            "aging_vendor",
+            "trend",
+            "expected",
+            "expected_month",
+            "expected_company",
+            "expected_company_month",
+            "outstanding_current",
+            "outstanding_month",
+            "total_payables_vendor",
+            "top_customers",
+            "vendor_summary",
+            "balance_by_vendor",
+            "outstanding_vendor_wise",
+        }
+
+        if scenario not in allowed:
+            logger.warning("Invalid scenario from LLM: %s", scenario)
+            scenario = "aging"
+
+        # Normalize month format if provided
+        if month:
+            try:
+                year, mon = month.split("-")
+                mon = int(mon)
+                month = f"{int(year):04d}-{mon:02d}"
+            except Exception:
+                logger.warning("Invalid month format from LLM: %s", month)
+                month = None
+
+        return scenario, month
+
+    except Exception as e:
+        logger.exception("Classifier error: %s", e)
+        # safe default: aging, no month
+        return "aging", None
+
+# ------------------------------------------------------
+# MSAL AUTH HELPERS
+# ------------------------------------------------------
+_msal_app: Optional[msal.ConfidentialClientApplication] = None
+
+
+def get_msal_app() -> msal.ConfidentialClientApplication:
+    global _msal_app
+    if _msal_app is None:
+        authority = f"https://login.microsoftonline.com/{TENANT_ID}"
+        _msal_app = msal.ConfidentialClientApplication(
+            CLIENT_ID,
+            authority=authority,
+            client_credential=CLIENT_SECRET,
+        )
+    return _msal_app
+
+
+def get_access_token() -> str:
+    app = get_msal_app()
+    scope = f"{DATAVERSE_URL}/.default"
+    token_result = app.acquire_token_silent([scope], account=None)
+    if not token_result:
+        token_result = app.acquire_token_for_client(scopes=[scope])
+    if "access_token" not in token_result:
+        raise RuntimeError(f"Failed to get access token: {token_result}")
+    return token_result["access_token"]
+
+# ------------------------------------------------------
+# DATAVERSE → PANDAS
+# ------------------------------------------------------
+def dataverse_get_table(table_name: str, select: Optional[str] = None) -> pd.DataFrame:
+    token = get_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Prefer": "odata.maxpagesize=5000",
+    }
+
+    base_url = f"{DATAVERSE_URL}/api/data/v9.2/{table_name}"
+    url = base_url
+    if select:
+        joiner = "&" if "?" in url else "?"
+        url = f"{url}{joiner}$select={select}"
+
     rows = []
-    while True:
-        res = requests.get(url, headers=HEADERS)
-        res.raise_for_status()
-        data = res.json()
-        batch = data.get("value", [])
-        rows.extend(batch)
-        logger.info(f"  Retrieved {len(batch)} rows (cumulative {len(rows)})")
-        next_link = data.get("@odata.nextLink")
-        if not next_link:
-            break
-        url = next_link
-        logger.info("  Following @odata.nextLink to next page...")
-    logger.info(f"Total rows fetched: {len(rows)}")
-    return rows
+    while url:
+        logger.info("Fetching Dataverse: %s", url)
+        resp = requests.get(url, headers=headers, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        rows.extend(data.get("value", []))
+        url = data.get("@odata.nextLink")
+
+    df = pd.DataFrame(rows)
+
+    # Normalize date columns to YYYY-MM-DD string for SQLite compatibility
+    for col in df.columns:
+        if "date" in col.lower():
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    return df
+
+# ------------------------------------------------------
+# PANDAS → SQLITE
+# ------------------------------------------------------
+def load_to_sqlite(df: pd.DataFrame, name: str, conn: sqlite3.Connection) -> None:
+    df.to_sql(name, conn, if_exists="replace", index=False)
+
+def build_sqlite_database_cached():
+    global _last_load_time, _cached_connection
+
+    # ------------------------------------------
+    # 1. If cached DB exists → check if alive
+    # ------------------------------------------
+    if _cached_connection is not None:
+        try:
+            # If this runs, connection is alive
+            _cached_connection.execute("SELECT 1")
+
+            # Check TTL
+            if time.time() - _last_load_time < CACHE_TTL:
+                return _cached_connection
+
+            # TTL expired → rebuild cache
+            logger.info("SQLite cache expired — rebuilding...")
+        except Exception:
+            # Connection is dead/closed → rebuild
+            logger.warning("Cached SQLite connection is closed — rebuilding...")
+        # Reset before rebuilding
+        _cached_connection = None
+
+    # ------------------------------------------
+    # 2. Build fresh SQLite in-memory DB
+    # ------------------------------------------
+    logger.info("Refreshing Dataverse → SQLite cache...")
+
+    conn = sqlite3.connect("cache.db", check_same_thread=False)
 
 
-# =====================================================
-# Global Pandas DataFrames (for payables logic)
-# =====================================================
-DF_COMPANY = None
-DF_VENDTRANS = None
-DF_VENDTABLE = None
-DF_PARTY = None
+    df_ledger = dataverse_get_table(TABLE_COMPANY)
+    df_vendtrans = dataverse_get_table(TABLE_VENDTRANS)
+    df_vendtable = dataverse_get_table(TABLE_VENDTABLE)
+    df_party = dataverse_get_table(TABLE_PARTYTABLE)
 
+    load_to_sqlite(df_ledger, "ledger", conn)
+    load_to_sqlite(df_vendtrans, "vendtrans", conn)
+    load_to_sqlite(df_vendtable, "vendtable", conn)
+    load_to_sqlite(df_party, "party", conn)
 
-# =====================================================
-# Load All Tables into Thread-Safe SQLite + Pandas
-# =====================================================
-def load_all_tables():
-    """
-    Fetch Dataverse tables, normalize JOIN keys, store into:
-    - global Pandas DataFrames (for payables logic)
-    - in-memory SQLite (for NL→SQL engine)
-    """
-    global DF_COMPANY, DF_VENDTRANS, DF_VENDTABLE, DF_PARTY
-
-    logger.info("🚀 Loading all tables from Dataverse...")
-
-    df_company = pd.DataFrame(
-        fetch_all(f"{DATAVERSE_URL}/api/data/v9.2/{TABLE_COMPANY}?$top=5000")
-    )
-    df_vendtrans = pd.DataFrame(
-        fetch_all(f"{DATAVERSE_URL}/api/data/v9.2/{TABLE_VENDTRANS}?$top=5000")
-    )
-    df_vendtable = pd.DataFrame(
-        fetch_all(f"{DATAVERSE_URL}/api/data/v9.2/{TABLE_VENDTABLE}?$top=5000")
-    )
-    df_party = pd.DataFrame(
-        fetch_all(f"{DATAVERSE_URL}/api/data/v9.2/{TABLE_PARTYTABLE}?$top=5000")
-    )
-
-    logger.info(
-        f"Raw counts - Company: {len(df_company)}, "
-        f"VendTrans: {len(df_vendtrans)}, VendTable: {len(df_vendtable)}, "
-        f"DirParty: {len(df_party)}"
-    )
-
-    # Drop unnamed columns if any
-    for name, df in [
-        ("Company", df_company),
-        ("VendTrans", df_vendtrans),
-        ("VendTable", df_vendtable),
-        ("DirPartyTable", df_party),
-    ]:
-        before = df.shape[1]
-        df.drop(
-            columns=[c for c in df.columns if "Unnamed" in c],
-            inplace=True,
-            errors="ignore",
-        )
-        after = df.shape[1]
-        if before != after:
-            logger.info(f"Dropped unnamed columns in {name}: {before} -> {after}")
-
-    logger.info("🔑 Normalizing join keys for all tables...")
-
-    # --------- NORMALIZE JOIN KEYS ---------
-    # Company code
-    if "mserp_name" in df_company.columns:
-        df_company["mserp_name"] = (
-            df_company["mserp_name"].astype(str).str.strip().str.upper()
-        )
-
-    # VendTrans: dataareaid + accountnum
-    if "mserp_dataareaid" in df_vendtrans.columns:
-        df_vendtrans["mserp_dataareaid"] = (
-            df_vendtrans["mserp_dataareaid"].astype(str).str.strip().str.upper()
-        )
-    if "mserp_accountnum" in df_vendtrans.columns:
-        df_vendtrans["mserp_accountnum"] = (
-            df_vendtrans["mserp_accountnum"].astype(str).str.strip()
-        )
-
-    # VendTable: dataareaid + accountnum + party
-    if "mserp_dataareaid" in df_vendtable.columns:
-        df_vendtable["mserp_dataareaid"] = (
-            df_vendtable["mserp_dataareaid"].astype(str).str.strip().str.upper()
-        )
-    if "mserp_accountnum" in df_vendtable.columns:
-        df_vendtable["mserp_accountnum"] = (
-            df_vendtable["mserp_accountnum"].astype(str).str.strip()
-        )
-    if "mserp_party" in df_vendtable.columns:
-        df_vendtable["mserp_party"] = (
-            df_vendtable["mserp_party"].astype(str).str.strip()
-        )
-
-    # DirPartyTable: sourcekey
-    if "mserp_sourcekey" in df_party.columns:
-        df_party["mserp_sourcekey"] = (
-            df_party["mserp_sourcekey"].astype(str).str.strip()
-        )
-
-    # Store in globals for Pandas-based payables logic
-    DF_COMPANY = df_company.copy()
-    DF_VENDTRANS = df_vendtrans.copy()
-    DF_VENDTABLE = df_vendtable.copy()
-    DF_PARTY = df_party.copy()
-
-    logger.info("✅ Global DataFrames stored for payables logic.")
-    logger.info(
-        f"DF sizes - Company: {len(DF_COMPANY)}, VendTrans: {len(DF_VENDTRANS)}, "
-        f"VendTable: {len(DF_VENDTABLE)}, DirParty: {len(DF_PARTY)}"
-    )
-
-    # THREAD-SAFE connection for NL2SQL engine
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-
-    # Insert normalized data into SQLite
-    logger.info("💾 Inserting normalized tables into in-memory SQLite...")
-    df_company.to_sql("Company", conn, if_exists="replace", index=False)
-    df_vendtrans.to_sql("VendTrans", conn, if_exists="replace", index=False)
-    df_vendtable.to_sql("VendTable", conn, if_exists="replace", index=False)
-    df_party.to_sql("DirPartyTable", conn, if_exists="replace", index=False)
-    logger.info("✅ All tables inserted into SQLite successfully.")
+    # ------------------------------------------
+    # 3. Store cache + timestamp
+    # ------------------------------------------
+    _cached_connection = conn
+    _last_load_time = time.time()
 
     return conn
 
 
-sqlite_conn = load_all_tables()
 
-# =====================================================
-# Payables Core Logic (Pandas only)
-# =====================================================
-
-def _ensure_loaded():
-    if any(df is None for df in [DF_COMPANY, DF_VENDTRANS, DF_VENDTABLE, DF_PARTY]):
-        logger.error("Global DataFrames not loaded correctly.")
-        raise RuntimeError("Global DataFrames not loaded. Check load_all_tables().")
-
-
-def build_payables_base_df(base_date: datetime | None = None) -> pd.DataFrame:
-    """
-    Build the fully joined AP dataset with computed flags and aging info.
-    """
-    _ensure_loaded()
-    if base_date is None:
-        base_date = datetime.utcnow()
-
-    logger.info(f"🧮 Building payables base DataFrame for base_date={base_date.date()}")
-
-    # Copy raw data
-    company = DF_COMPANY.copy()
-    vendtrans = DF_VENDTRANS.copy()
-    vendtable = DF_VENDTABLE.copy()
-    dirparty = DF_PARTY.copy()
-
-    logger.info(
-        f"Raw DF sizes - Company: {len(company)}, VendTrans: {len(vendtrans)}, "
-        f"VendTable: {len(vendtable)}, DirParty: {len(dirparty)}"
-    )
-
-    # Defensive normalization
-    company["mserp_name"] = company["mserp_name"].astype(str).str.strip().str.upper()
-    vendtrans["mserp_dataareaid"] = (
-        vendtrans["mserp_dataareaid"].astype(str).str.strip().str.upper()
-    )
-    vendtable["mserp_dataareaid"] = (
-        vendtable["mserp_dataareaid"].astype(str).str.strip().str.upper()
-    )
-
-    vendtrans["mserp_accountnum"] = vendtrans["mserp_accountnum"].astype(str).str.strip()
-    vendtable["mserp_accountnum"] = vendtable["mserp_accountnum"].astype(str).str.strip()
-    vendtable["mserp_party"] = vendtable["mserp_party"].astype(str).str.strip()
-    dirparty["mserp_sourcekey"] = dirparty["mserp_sourcekey"].astype(str).str.strip()
-
-    # Convert date columns in VendTrans
-    for col in ["mserp_transdate", "mserp_duedate", "mserp_closed"]:
-        if col in vendtrans.columns:
-            vendtrans[col] = pd.to_datetime(vendtrans[col], errors="coerce")
-
-    # Rename company columns
-    company = company.rename(
-        columns={
-            "mserp_name": "CompanyCode",
-            "mserp_description": "CompanyName",
-            "mserp_accountingcurrency": "CompanyCurrency",
+# ------------------------------------------------------
+# QUICKCHART HELPER
+# ------------------------------------------------------
+def make_chart_url(chart_type: str, labels: list, values: list) -> str:
+    config = {
+        "type": chart_type,   # "pie", "bar", "line"
+        "data": {
+            "labels": labels,
+            "datasets": [{
+                "label": "Total Outstanding",
+                "data": values
+            }]
         }
-    )
-
-    # ---- Step 1: Company ↔ VendTrans ----
-    merged = company.merge(
-        vendtrans,
-        left_on="CompanyCode",
-        right_on="mserp_dataareaid",
-        how="inner",
-    )
-    logger.info(f"After Company↔VendTrans join: {len(merged)} rows")
-
-    # ---- Step 2: VendTrans ↔ VendTable ----
-    merged = merged.merge(
-        vendtable,
-        on=["mserp_accountnum", "mserp_dataareaid"],
-        how="inner",
-        suffixes=("", "_VendTable"),
-    )
-    logger.info(f"After VendTrans↔VendTable join: {len(merged)} rows")
-
-    # ---- Step 3: VendTable ↔ DirParty (Vendor Name) ----
-    merged = merged.merge(
-        dirparty,
-        left_on="mserp_party",
-        right_on="mserp_sourcekey",
-        how="inner",
-        suffixes=("", "_DirParty"),
-    )
-    logger.info(f"After VendTable↔DirParty join: {len(merged)} rows")
-
-    # Vendor name from DirPartyTable.mserp_name
-    if "mserp_name" in merged.columns:
-        merged = merged.rename(columns={"mserp_name": "VendorName"})
-    merged["VendorCode"] = merged["mserp_accountnum"]
-
-    # Exclude system company DAT
-    before_dat = len(merged)
-    merged = merged[merged["CompanyCode"] != "DAT"]
-    after_dat = len(merged)
-    if before_dat != after_dat:
-        logger.info(f"Filtered out DAT company rows: {before_dat} -> {after_dat}")
-
-    # ---- Add payables core logic ----
-    merged = add_payables_logic(merged)
-    merged = add_aging_buckets(merged, base_date)
-
-    logger.info(f"✅ Final payables base DF rows: {len(merged)}")
-    return merged
-
-
-def add_payables_logic(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add core AP fields:
-    - amount_mst, settle_amount_mst
-    - balance_mst (매입지급잔액)
-    - is_purchase, is_payment
-    - closed_valid (정산완료일 존재)
-    """
-    df = df.copy()
-
-    for col in ["mserp_amountmst", "mserp_settleamountmst"]:
-        if col not in df.columns:
-            logger.error(f"Column {col} missing in AP dataset.")
-            raise ValueError(f"Column {col} missing in AP dataset.")
-
-    df["amount_mst"] = pd.to_numeric(df["mserp_amountmst"], errors="coerce").fillna(0)
-    df["settle_amount_mst"] = pd.to_numeric(
-        df["mserp_settleamountmst"], errors="coerce"
-    ).fillna(0)
-
-    # 매입지급잔액 = (amount - settle) * -1
-    df["balance_mst"] = (df["amount_mst"] - df["settle_amount_mst"]) * -1
-
-    # Purchase vs Payment flags
-    df["is_purchase"] = df["amount_mst"] < 0  # 매입
-    df["is_payment"] = df["amount_mst"] > 0   # 지급
-
-    sentinel = pd.Timestamp(1900, 1, 1)
-    df["closed_valid"] = df["mserp_closed"].notna() & (df["mserp_closed"] > sentinel)
-
-    return df
-
-
-def add_aging_buckets(df: pd.DataFrame, base_date: datetime) -> pd.DataFrame:
-    """
-    Add aging buckets based on DueDate vs base_date.
-
-    Buckets (for open, purchase transactions):
-    - OVERDUE: DueDate < base_date
-    - 0-30:    0 <= days_to_due <= 30
-    - 31-60:   31 <= days_to_due <= 60
-    - 61-90:   61 <= days_to_due <= 90
-    - 90+:     days_to_due > 90
-    """
-    df = df.copy()
-
-    if "mserp_duedate" not in df.columns:
-        df["aging_bucket"] = None
-        return df
-
-    base_d = pd.Timestamp(base_date.date())
-
-    df["days_to_due"] = (
-        df["mserp_duedate"].dt.normalize() - base_d
-    ).dt.days
-
-    df["is_overdue"] = df["days_to_due"] < 0
-
-    def bucket(days):
-        if pd.isna(days):
-            return None
-        d = int(days)
-        if d < 0:
-            return "OVERDUE"
-        if 0 <= d <= 30:
-            return "0-30"
-        if 31 <= d <= 60:
-            return "31-60"
-        if 61 <= d <= 90:
-            return "61-90"
-        if d > 90:
-            return "90+"
-        return None
-
-    open_purchase_mask = (
-        df["is_purchase"]
-        & (~df["closed_valid"])
-        & df["mserp_duedate"].notna()
-    )
-
-    df.loc[open_purchase_mask, "aging_bucket"] = df.loc[
-        open_purchase_mask, "days_to_due"
-    ].apply(bucket)
-
-    return df
-
-
-def get_overdue_summary(df: pd.DataFrame, base_date: datetime) -> dict:
-    """
-    Overdue summary:
-    - Only purchase, open, with DueDate < base_date.
-    """
-    base_d = pd.Timestamp(base_date.date())
-    mask = (
-        df["is_purchase"]
-        & (~df["closed_valid"])
-        & df["mserp_duedate"].notna()
-        & (df["mserp_duedate"] < base_d)
-    )
-    overdue_dues = df.loc[mask, "mserp_duedate"]
-    overdue_balance = df.loc[mask, "balance_mst"].sum()
-
-    logger.info(
-        f"Overdue summary as of {base_d.date()}: count={int(mask.sum())}, "
-        f"total_balance={float(overdue_balance)}"
-    )
-
-    return {
-        "base_date": str(base_d.date()),
-        "overdue_count": int(mask.sum()),
-        "min_overdue_duedate": (
-            overdue_dues.min().strftime("%Y-%m-%d") if not overdue_dues.empty else None
-        ),
-        "max_overdue_duedate": (
-            overdue_dues.max().strftime("%Y-%m-%d") if not overdue_dues.empty else None
-        ),
-        "total_overdue_balance_mst": float(overdue_balance),
     }
+    return "https://quickchart.io/chart?c=" + urllib.parse.quote(str(config))
 
 
-def get_week_range(base_date: datetime):
+# ------------------------------------------------------
+# SQL MODULES - EXISTING
+# ------------------------------------------------------
+def sql_aging_vendor(conn: sqlite3.Connection, chart_type: str):
     """
-    Get Sunday–Saturday week range containing base_date.
+    Vendor Aging Report (Vendor-wise)
+    Buckets: 0–30, 31–60, 61–90, Over 90 days
+    Using vendtrans table.
     """
-    # Monday=0 ... Sunday=6
-    weekday = base_date.weekday()
-    # Previous Sunday (as "week start")
-    sunday = base_date - timedelta(days=(weekday + 1) % 7)
-    saturday = sunday + timedelta(days=6)
-    return sunday.date(), saturday.date()
-
-
-def get_weekly_expected_payments(df: pd.DataFrame, base_date: datetime) -> pd.DataFrame:
+    q = """
+    SELECT
+        mserp_accountnum AS vendor,
+        mserp_duedate     AS due_date,
+        (mserp_amountmst - mserp_settleamountmst) AS outstanding
+    FROM vendtrans
+    WHERE (mserp_amountmst - mserp_settleamountmst) > 0;
     """
-    금주 지급액:
-    - 기준: DueDate in this week (Sunday–Saturday)
-    - 대상: 매입 (amount < 0), open (not closed_valid)
-    - 금액: 매입지급잔액 (balance_mst)
-    """
-    week_start, week_end = get_week_range(base_date)
-    logger.info(
-        f"Calculating weekly expected payments for week {week_start} to {week_end}"
-    )
+    df = pd.read_sql_query(q, conn)
 
-    mask = (
-        df["is_purchase"]
-        & (~df["closed_valid"])
-        & df["mserp_duedate"].notna()
-        & (df["mserp_duedate"].dt.date >= week_start)
-        & (df["mserp_duedate"].dt.date <= week_end)
-    )
+    # If no data
+    if df.empty:
+        text = "📊 Vendor Aging Report (Vendor-wise):\n\nNo outstanding invoices."
+        tables = {"aging_vendor": []}
+        chart_url = make_chart_url(chart_type, [], [])
+        return text, tables, chart_url
 
-    weekly = (
-        df.loc[mask]
-        .assign(DueDateDate=lambda x: x["mserp_duedate"].dt.date)
-        .groupby(
-            [
-                "CompanyCode",
-                "CompanyName",
-                "CompanyCurrency",
-                "DueDateDate",
-            ],
-            as_index=False,
-        )["balance_mst"]
-        .sum()
-        .rename(
-            columns={
-                "DueDateDate": "DueDate",
-                "balance_mst": "WeeklyExpectedPaymentMST",
-            }
-        )
-    )
+    # Clean date
+    df = df.dropna(subset=["due_date"])
+    df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
+    df = df.dropna(subset=["due_date"])
 
-    logger.info(f"Weekly expected payments rows: {len(weekly)}")
-    return weekly
+    # Calculate days overdue
+    today_ts = pd.Timestamp.today().normalize()
+    df["days_overdue"] = (today_ts - df["due_date"]).dt.days
 
-
-def get_company_aging_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Group by Company & aging bucket and sum balance_mst.
-    Only open purchase items.
-    """
-    mask = (
-        df["is_purchase"]
-        & (~df["closed_valid"])
-        & df["mserp_duedate"].notna()
-        & df["aging_bucket"].notna()
-    )
-
-    grouped = (
-        df.loc[mask]
-        .groupby(
-            ["CompanyCode", "CompanyName", "CompanyCurrency", "aging_bucket"],
-            as_index=False,
-        )["balance_mst"]
-        .sum()
-        .rename(
-            columns={
-                "aging_bucket": "Bucket",
-                "balance_mst": "AmountMST",
-            }
-        )
-        .sort_values(["CompanyCode", "Bucket"])
-    )
-
-    logger.info(f"Company aging summary rows: {len(grouped)}")
-    return grouped
-
-
-# =====================================================
-# Request Model
-# =====================================================
-class Query(BaseModel):
-    question: str
-
-
-# =====================================================
-# SQL Generator Prompt (SQLite-aware, balance_mst-aware)
-# =====================================================
-SQL_PROMPT = """
-You are an expert SQL generator for financial data.
-
-The database is **SQLite**. You MUST generate SQL that is valid for SQLite.
-
-Date rules:
-- Use only SQLite date functions:
-  - DATE('now')
-  - DATE('now', '+30 days')
-  - DATE('now', '-30 days')
-  - DATE('now', '+60 days')
-  - DATE('now', '+90 days')
-  - DATE(column_name)
-- For date ranges, use:
-  - BETWEEN DATE('now', '-30 days') AND DATE('now')      -- last 30 days (past)
-  - BETWEEN DATE('now') AND DATE('now', '+30 days')      -- next 30 days (future)
-- You MAY use JULIANDAY() if you need date differences.
-- Do NOT use SQL Server / T-SQL functions:
-  - DATEADD, DATEDIFF, GETDATE, CURRENT_TIMESTAMP + interval, DAY(), MONTH(), YEAR()
-
-IMPORTANT interpretation:
-- If the user says: "within 30 days as of the current date"
-  → interpret as the **last 30 days up to today**:
-    DATE(column) BETWEEN DATE('now', '-30 days') AND DATE('now').
-- If the user says: "within the last 30 days", "past 30 days"
-  → also use DATE('now', '-30 days') to DATE('now').
-- If the user explicitly says: "within the next 30 days", "upcoming 30 days"
-  → use DATE('now') to DATE('now', '+30 days').
-
-Payables amount rule (VERY IMPORTANT):
-- For ANY question about:
-  - payables, outstanding amounts, balances, vendor balance, company balance,
-  - aging, overdue, amounts due within/past X days, due dates,
-  you MUST use the following expression as the amount in base currency:
-
-  (VendTrans.mserp_amountmst - VendTrans.mserp_settleamountmst) * -1
-
-- When you aggregate this, ALWAYS wrap it with COALESCE(SUM(...), 0) so that the result is never NULL.
-
-  Example:
-  COALESCE(SUM((VendTrans.mserp_amountmst - VendTrans.mserp_settleamountmst) * -1), 0) AS TotalPayables
-
-Open purchase filter (for payables and amounts due):
-- Always restrict to open purchase items:
-  VendTrans.mserp_amountmst < 0
-  AND (VendTrans.mserp_closed IS NULL OR VendTrans.mserp_closed < '1900-01-01')
-
-Tables you can use (already loaded in SQLite):
-- Company
-- VendTrans
-- VendTable
-- DirPartyTable
-
-Standard join (keys are normalized to UPPERCASE already):
-
-SELECT
-    Company.mserp_name AS CorporateCode,
-    Company.mserp_description AS CorporateName,
-    Company.mserp_accountingcurrency,
-    VendTrans.mserp_accountnum AS VendorCode,
-    VendTrans.mserp_currencycode AS Currency,
-    VendTrans.mserp_amountcur AS Amount_FCY,
-    VendTrans.mserp_amountmst AS Amount_KRW,
-    (VendTrans.mserp_amountcur - VendTrans.mserp_settleamountcur) AS Balance_FCY,
-    (VendTrans.mserp_amountmst - VendTrans.mserp_settleamountmst) AS Balance_KRW,
-    VendTrans.mserp_transdate,
-    VendTrans.mserp_duedate,
-    VendTrans.mserp_closed,
-    DirPartyTable.mserp_name AS VendorName
-FROM Company
-JOIN VendTrans
-    ON VendTrans.mserp_dataareaid = Company.mserp_name
-JOIN VendTable
-    ON VendTable.mserp_accountnum = VendTrans.mserp_accountnum
-   AND VendTable.mserp_dataareaid = VendTrans.mserp_dataareaid
-JOIN DirPartyTable
-    ON DirPartyTable.mserp_sourcekey = VendTable.mserp_party
-WHERE Company.mserp_name <> 'DAT';
-
-Example for this specific question:
-
-"Total amount with a due date within 30 days as of the current date"
-→ interpret as **last 30 days**:
-
-SELECT
-    COALESCE(SUM((VendTrans.mserp_amountmst - VendTrans.mserp_settleamountmst) * -1), 0)
-        AS TotalAmountDueLast30Days
-FROM Company
-JOIN VendTrans
-    ON VendTrans.mserp_dataareaid = Company.mserp_name
-JOIN VendTable
-    ON VendTable.mserp_accountnum = VendTrans.mserp_accountnum
-   AND VendTable.mserp_dataareaid = VendTrans.mserp_dataareaid
-JOIN DirPartyTable
-    ON DirPartyTable.mserp_sourcekey = VendTable.mserp_party
-WHERE Company.mserp_name <> 'DAT'
-  AND VendTrans.mserp_amountmst < 0
-  AND (VendTrans.mserp_closed IS NULL OR VendTrans.mserp_closed < '1900-01-01')
-  AND DATE(VendTrans.mserp_duedate)
-      BETWEEN DATE('now','-30 days') AND DATE('now');
-
-Rules:
-- Return ONLY pure SQL text (no markdown, no ```sql).
-- Do NOT hallucinate column names.
-"""
-
-# =====================================================
-# SQL Cleanup
-# =====================================================
-def clean_sql(sql: str) -> str:
-    return (
-        sql.replace("```sql", "")
-        .replace("```", "")
-        .replace("`", "")
-        .strip()
-    )
-
-
-# =====================================================
-# SQL Generation
-# =====================================================
-def generate_sql(question: str) -> str:
-    logger.info("🎯 Generating SQL from NL question using Azure OpenAI...")
-    response = client_aoai.chat.completions.create(
-        model=AZURE_OPENAI_DEPLOYMENT,
-        messages=[
-            {"role": "system", "content": SQL_PROMPT},
-            {"role": "user", "content": question},
-        ],
-    )
-    sql = response.choices[0].message.content
-    sql_clean = clean_sql(sql)
-    logger.info(f"Generated SQL:\n{sql_clean}")
-    return sql_clean
-
-
-# =====================================================
-# Natural Language Summary Prompt
-# =====================================================
-SUMMARY_PROMPT = """
-You are an expert financial data analyst.
-
-Given:
-- The user's natural language question.
-- The SQL query result as JSON records.
-
-Produce a clear, concise natural-language summary that:
-- Mentions vendor or company names when relevant.
-- Explains totals (e.g., total amount within the last 30 days).
-- Mentions currencies (FCY / KRW) where available.
-- Is suitable as a chatbot answer.
-
-If the total is 0 or the result is empty, clearly say that there are no applicable amounts for that condition.
-
-Do NOT return code, tables, or SQL. Just plain sentences or bullet points.
-"""
-
-# =====================================================
-# Generate Natural Language Summary
-# =====================================================
-def generate_summary(question: str, df: pd.DataFrame) -> str:
-    data_json = df.to_dict(orient="records")
-
-    logger.info("🧾 Calling AOAI to generate natural language summary...")
-    response = client_aoai.chat.completions.create(
-        model=AZURE_OPENAI_DEPLOYMENT,
-        messages=[
-            {"role": "system", "content": SUMMARY_PROMPT},
-            {"role": "user", "content": f"User Question: {question}"},
-            {
-                "role": "user",
-                "content": f"SQL Output Data (list of records): {data_json}",
-            },
-        ],
-    )
-    summary = response.choices[0].message.content.strip()
-    logger.info(f"Summary generated:\n{summary}")
-    return summary
-
-
-# =====================================================
-# FastAPI App
-# =====================================================
-app = FastAPI()
-
-
-@app.post("/chat")
-def chat(q: Query):
-    logger.info("==========================================")
-    logger.info("🚀 New /chat Request")
-    logger.info(f"Question: {q.question}")
-    logger.info("==========================================")
-
-    # 1) NL -> SQL
-    sql_query = generate_sql(q.question)
-
-    try:
-        # 2) Execute SQL
-        logger.info("📌 Executing SQL in SQLite...")
-        logger.info(f"SQL:\n{sql_query}")
-        df = pd.read_sql_query(sql_query, sqlite_conn)
-        logger.info(f"📌 SQL Execution Complete. Returned Rows: {len(df)}")
-
-        # 3) Generate natural-language summary
-        logger.info("📌 Generating Summary...")
-        if not df.empty:
-            logger.info("📌 Sample data (first 5 rows):")
-            logger.info(df.head().to_string())
+    # Bucketing
+    def bucket(days: float) -> str:
+        if days <= 30:
+            return "0–30 days"
+        elif days <= 60:
+            return "31–60 days"
+        elif days <= 90:
+            return "61–90 days"
         else:
-            logger.info("📌 DataFrame is empty. No rows to preview.")
+            return "Over 90 days"
 
-        summary = generate_summary(q.question, df)
+    df["bucket"] = df["days_overdue"].apply(bucket)
 
-        return {
-            "question": q.question,
-            "sql": sql_query,
-            "rows": len(df),
-            "summary": summary,
-            "data": df.to_dict(orient="records"),
-        }
+    # Group vendor-wise
+    grouped = df.groupby(["vendor", "bucket"], as_index=False)["outstanding"].sum()
+
+    # Text output
+    lines = ["📊 Vendor Aging Report (Vendor-wise):"]
+    for vendor, sub in grouped.groupby("vendor"):
+        lines.append(f"\n{vendor}:")
+        for _, row in sub.iterrows():
+            lines.append(f"  • {row['bucket']}: {row['outstanding']:,.0f}")
+    text = "\n".join(lines)
+
+    # Chart: bucket totals
+    bucket_totals = (
+        df.groupby("bucket")["outstanding"]
+        .sum()
+        .reindex(["0–30 days", "31–60 days", "61–90 days", "Over 90 days"], fill_value=0)
+    )
+
+    labels = bucket_totals.index.tolist()
+    values = bucket_totals.tolist()
+
+    chart_url = make_chart_url(chart_type, labels, values)
+
+    tables = {"aging_vendor": grouped.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+def sql_trend(conn: sqlite3.Connection, chart_type: str):
+    """
+    Purchasing & payment trend over last 6 months based on transaction date.
+    Negative amounts → purchases, positive → payments.
+    """
+    q = """
+    SELECT 
+        strftime('%Y-%m', mserp_transdate) AS month,
+        SUM(CASE WHEN mserp_amountmst < 0 THEN -mserp_amountmst ELSE 0 END) AS purchases,
+        SUM(CASE WHEN mserp_amountmst > 0 THEN  mserp_amountmst ELSE 0 END) AS payments
+    FROM vendtrans
+    WHERE date(mserp_transdate) >= date('now','start of month','-5 month')
+    GROUP BY month
+    ORDER BY month;
+    """
+    df = pd.read_sql_query(q, conn)
+
+    labels = df["month"].tolist()
+    purchases = df["purchases"].tolist()
+    payments = df["payments"].tolist()
+
+    # We still use purchases as base; if you want multi-series charts,
+    # you can extend make_chart_url to accept datasets.
+    chart_url = make_chart_url(chart_type, labels, purchases)
+
+    lines = ["📊 Purchasing & Payment Trend (Last 6 Months, KRW):"]
+    for _, row in df.iterrows():
+        lines.append(
+            f"{row['month']} → Purchases: {row['purchases']:,.0f}  |  Payments: {row['payments']:,.0f}"
+        )
+    text = "\n".join(lines)
+
+    tables = {"trend": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+def sql_expected_payments(conn: sqlite3.Connection, chart_type: str):
+    """
+    Expected payments for this week (all companies, daily).
+    """
+    today = date.today()
+    start = today - timedelta(days=today.weekday())          # Monday
+    end = start + timedelta(days=6)                          # Sunday
+
+    q = f"""
+    SELECT
+        mserp_duedate AS due_date,
+        SUM(mserp_amountmst - mserp_settleamountmst) AS total_outstanding
+    FROM vendtrans
+    WHERE (mserp_amountmst - mserp_settleamountmst) > 0
+      AND date(mserp_duedate) BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
+    GROUP BY mserp_duedate
+    ORDER BY mserp_duedate;
+    """
+    df = pd.read_sql_query(q, conn)
+
+    labels = df["due_date"].tolist()
+    data = df["total_outstanding"].tolist()
+
+    chart_url = make_chart_url(
+        chart_type,
+        labels,
+        data,
+    )
+
+    lines = ["📅 Expected Vendor Payments — This Week (KRW):"]
+    for d, v in zip(labels, data):
+        lines.append(f"{d}: {v:,.0f}")
+    text = "\n".join(lines)
+
+    tables = {"expected": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+def sql_expected_payments_by_company(conn: sqlite3.Connection, chart_type: str):
+    """
+    Expected payments for this week:
+      - Company-wise + vendor-wise (mserp_dataareaid + mserp_accountnum) by day.
+      - Table: detailed rows (company, vendor, due_date, total_outstanding).
+      - Chart: summarized per company per date.
+    """
+    today = date.today()
+    start = today - timedelta(days=today.weekday())   # Monday
+    end = start + timedelta(days=6)                   # Sunday
+
+    q = f"""
+    SELECT
+        mserp_dataareaid AS company,
+        mserp_accountnum AS vendor,
+        mserp_duedate    AS due_date,
+        SUM(mserp_amountmst - mserp_settleamountmst) AS total_outstanding
+    FROM vendtrans
+    WHERE (mserp_amountmst - mserp_settleamountmst) > 0
+      AND date(mserp_duedate) BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
+    GROUP BY mserp_dataareaid, mserp_accountnum, mserp_duedate
+    ORDER BY mserp_duedate, mserp_dataareaid, mserp_accountnum;
+    """
+    df = pd.read_sql_query(q, conn)
+
+    if df.empty:
+        text = (
+            "📅 Expected Vendor Payments — This Week (Company & Vendor-wise, KRW):\n\n"
+            "No outstanding payments for this week."
+        )
+        tables = {"expected_company": []}
+        chart_url = make_chart_url(chart_type, [], [])
+        return text, tables, chart_url
+
+    # Chart: company-level totals per date
+    agg = (
+        df.groupby(["due_date", "company"], as_index=False)["total_outstanding"]
+        .sum()
+    )
+
+    pivot = agg.pivot_table(
+        index="due_date",
+        columns="company",
+        values="total_outstanding",
+        aggfunc="sum",
+        fill_value=0.0,
+    ).sort_index()
+
+    labels = pivot.index.tolist()
+    # Use first company series for chart base
+    first_company = pivot.columns[0]
+    chart_url = make_chart_url(chart_type, labels, pivot[first_company].tolist())
+
+    # Text summary: by date → company → vendor
+    lines = ["📅 Expected Vendor Payments — This Week (Company & Vendor-wise, KRW):"]
+    for due_date, sub_date in df.groupby("due_date"):
+        lines.append(f"\n{due_date}:")
+        for company, sub_comp in sub_date.groupby("company"):
+            total_company = sub_comp["total_outstanding"].sum()
+            lines.append(f"  • {company}: {total_company:,.0f}")
+            for _, row in sub_comp.iterrows():
+                lines.append(
+                    f"      - {row['vendor']}: {row['total_outstanding']:,.0f}"
+                )
+
+    text = "\n".join(lines)
+
+    tables = {"expected_company": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+# ------------------------------------------------------
+# NEW: EXPECTED PAYMENTS FOR A SPECIFIC MONTH
+# ------------------------------------------------------
+def _month_start_end(month_yyyy_mm: str) -> Tuple[date, date]:
+    year_str, mon_str = month_yyyy_mm.split("-")
+    year = int(year_str)
+    mon = int(mon_str)
+    start_date = date(year, mon, 1)
+    if mon == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, mon + 1, 1)
+    end_date = next_month - timedelta(days=1)
+    return start_date, end_date
+
+
+def sql_expected_payments_month(conn: sqlite3.Connection, chart_type: str, month_yyyy_mm: str):
+    """
+    Expected payments for a specific month (all companies, daily).
+    """
+    start_date, end_date = _month_start_end(month_yyyy_mm)
+
+    q = f"""
+    SELECT
+        mserp_duedate AS due_date,
+        SUM(mserp_amountmst - mserp_settleamountmst) AS total_outstanding
+    FROM vendtrans
+    WHERE (mserp_amountmst - mserp_settleamountmst) > 0
+      AND date(mserp_duedate) BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+    GROUP BY mserp_duedate
+    ORDER BY mserp_duedate;
+    """
+    df = pd.read_sql_query(q, conn)
+
+    labels = df["due_date"].tolist()
+    data = df["total_outstanding"].tolist()
+
+    chart_url = make_chart_url(chart_type, labels, data)
+
+    lines = [f"📅 Expected Vendor Payments — {month_yyyy_mm} (KRW):"]
+    for d, v in zip(labels, data):
+        lines.append(f"{d}: {v:,.0f}")
+    text = "\n".join(lines)
+
+    tables = {"expected": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+def sql_expected_payments_by_company_month(conn: sqlite3.Connection, chart_type: str, month_yyyy_mm: str):
+    """
+    Expected payments for a specific month:
+      - Company-wise + vendor-wise (mserp_dataareaid + mserp_accountnum) by day.
+    """
+    start_date, end_date = _month_start_end(month_yyyy_mm)
+
+    q = f"""
+    SELECT
+        mserp_dataareaid AS company,
+        mserp_accountnum AS vendor,
+        mserp_duedate    AS due_date,
+        SUM(mserp_amountmst - mserp_settleamountmst) AS total_outstanding
+    FROM vendtrans
+    WHERE (mserp_amountmst - mserp_settleamountmst) > 0
+      AND date(mserp_duedate) BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+    GROUP BY mserp_dataareaid, mserp_accountnum, mserp_duedate
+    ORDER BY mserp_duedate, mserp_dataareaid, mserp_accountnum;
+    """
+    df = pd.read_sql_query(q, conn)
+
+    if df.empty:
+        text = (
+            f"📅 Expected Vendor Payments — {month_yyyy_mm} (Company & Vendor-wise, KRW):\n\n"
+            "No outstanding payments for this period."
+        )
+        tables = {"expected_company": []}
+        chart_url = make_chart_url(chart_type, [], [])
+        return text, tables, chart_url
+
+    # Chart: company-level totals per date
+    agg = (
+        df.groupby(["due_date", "company"], as_index=False)["total_outstanding"]
+        .sum()
+    )
+
+    pivot = agg.pivot_table(
+        index="due_date",
+        columns="company",
+        values="total_outstanding",
+        aggfunc="sum",
+        fill_value=0.0,
+    ).sort_index()
+
+    labels = pivot.index.tolist()
+    first_company = pivot.columns[0]
+    chart_url = make_chart_url(chart_type, labels, pivot[first_company].tolist())
+
+    lines = [f"📅 Expected Vendor Payments — {month_yyyy_mm} (Company & Vendor-wise, KRW):"]
+    for due_date, sub_date in df.groupby("due_date"):
+        lines.append(f"\n{due_date}:")
+        for company, sub_comp in sub_date.groupby("company"):
+            total_company = sub_comp["total_outstanding"].sum()
+            lines.append(f"  • {company}: {total_company:,.0f}")
+            for _, row in sub_comp.iterrows():
+                lines.append(
+                    f"      - {row['vendor']}: {row['total_outstanding']:,.0f}"
+                )
+
+    text = "\n".join(lines)
+    tables = {"expected_company": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+# ------------------------------------------------------
+# OUTSTANDING MONTH FUNCTIONS (existing)
+# ------------------------------------------------------
+def sql_outstanding_this_month(conn: sqlite3.Connection, chart_type: str):
+    """
+    Outstanding vendor payments for the CURRENT month.
+    """
+    q = """
+    SELECT
+        mserp_duedate AS due_date,
+        SUM(mserp_amountmst - mserp_settleamountmst) AS outstanding
+    FROM vendtrans
+    WHERE (mserp_amountmst - mserp_settleamountmst) > 0
+      AND date(mserp_duedate) BETWEEN date('now','start of month')
+                                  AND date('now','start of month','+1 month','-1 day')
+    GROUP BY mserp_duedate
+    ORDER BY mserp_duedate;
+    """
+    df = pd.read_sql_query(q, conn)
+    df["outstanding"] = df["outstanding"].fillna(0)
+
+    total_outstanding = float(df["outstanding"].sum()) if not df.empty else 0.0
+    labels = df["due_date"].tolist()
+    data = df["outstanding"].tolist()
+
+    chart_url = make_chart_url(
+        chart_type,
+        labels,
+        data,
+    )
+
+    today = date.today()
+    start_date = today.replace(day=1)
+    if today.month == 12:
+        next_month = date(today.year + 1, 1, 1)
+    else:
+        next_month = date(today.year, today.month + 1, 1)
+    end_date = next_month - timedelta(days=1)
+
+    lines = [
+        f"📅 Outstanding Vendor Payments — This Month ({start_date.isoformat()} → {end_date.isoformat()}):",
+        "",
+        f"Total Outstanding: {total_outstanding:,.0f} KRW",
+    ]
+    if not df.empty:
+        lines.append("")
+        lines.append("Per-day breakdown:")
+        for d, v in zip(labels, data):
+            lines.append(f"{d} → {v:,.0f}")
+
+    text = "\n".join(lines)
+    tables = {"outstanding_month": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+def sql_outstanding_for_month(conn: sqlite3.Connection, month_yyyy_mm: str, chart_type: str):
+    """
+    Outstanding vendor payments for a specific calendar month (YYYY-MM).
+    """
+    year_str, mon_str = month_yyyy_mm.split("-")
+    year = int(year_str)
+    mon = int(mon_str)
+
+    start_date = date(year, mon, 1)
+    if mon == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, mon + 1, 1)
+    end_date = next_month - timedelta(days=1)
+
+    q = f"""
+    SELECT
+        mserp_duedate AS due_date,
+        SUM(mserp_amountmst - mserp_settleamountmst) AS outstanding
+    FROM vendtrans
+    WHERE (mserp_amountmst - mserp_settleamountmst) > 0
+      AND date(mserp_duedate) BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+    GROUP BY mserp_duedate
+    ORDER BY mserp_duedate;
+    """
+    df = pd.read_sql_query(q, conn)
+    df["outstanding"] = df["outstanding"].fillna(0)
+
+    total_outstanding = float(df["outstanding"].sum()) if not df.empty else 0.0
+    labels = df["due_date"].tolist()
+    data = df["outstanding"].tolist()
+
+    chart_url = make_chart_url(
+        chart_type,
+        labels,
+        data,
+    )
+
+    lines = [
+        f"📅 Outstanding Vendor Payments — {month_yyyy_mm}:",
+        "",
+        f"Total Outstanding: {total_outstanding:,.0f} KRW",
+    ]
+    if not df.empty:
+        lines.append("")
+        lines.append("Per-day breakdown:")
+        for d, v in zip(labels, data):
+            lines.append(f"{d} → {v:,.0f}")
+
+    text = "\n".join(lines)
+    tables = {"outstanding_month": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+# ------------------------------------------------------
+# SQL MODULES - NEW SCENARIOS (existing in your file)
+# ------------------------------------------------------
+def sql_total_payables_vendor(conn: sqlite3.Connection, chart_type: str):
+    """
+    Total payables by vendor (sum of outstanding per vendor).
+    """
+    q = """
+    SELECT 
+        mserp_accountnum AS vendor,
+        SUM(mserp_amountmst - mserp_settleamountmst) AS total_outstanding
+    FROM vendtrans
+    WHERE (mserp_amountmst - mserp_settleamountmst) > 0
+    GROUP BY mserp_accountnum
+    ORDER BY total_outstanding DESC;
+    """
+    df = pd.read_sql_query(q, conn)
+
+    labels = df["vendor"].tolist()
+    values = df["total_outstanding"].tolist()
+    chart_url = make_chart_url(chart_type, labels, values)
+
+    lines = ["📊 Total Payables by Vendor:"]
+    for _, r in df.iterrows():
+        lines.append(f"{r['vendor']} → {r['total_outstanding']:,.0f}")
+    text = "\n".join(lines)
+
+    tables = {"total_payables_vendor": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+def sql_top_customers(conn, chart_type, month=None):
+    if month:
+        q = f"""
+        SELECT 
+            mserp_accountnum AS customer,
+            SUM(
+                CASE WHEN mserp_amountmst < 0 THEN -mserp_amountmst
+                     ELSE  mserp_amountmst END
+            ) AS total_amount
+        FROM vendtrans
+        WHERE strftime('%Y-%m', mserp_transdate) = '{month}'
+        GROUP BY mserp_accountnum
+        ORDER BY total_amount DESC
+        LIMIT 10;
+        """
+    else:
+        q = """
+        SELECT 
+            mserp_accountnum AS customer,
+            SUM(
+                CASE WHEN mserp_amountmst < 0 THEN -mserp_amountmst
+                     ELSE  mserp_amountmst END
+            ) AS total_amount
+        FROM vendtrans
+        GROUP BY mserp_accountnum
+        ORDER BY total_amount DESC
+        LIMIT 10;
+        """
+
+    df = pd.read_sql_query(q, conn)
+
+    labels = df["customer"].tolist()
+    values = df["total_amount"].tolist()
+
+    chart_url = make_chart_url(chart_type, labels, values)
+
+    lines = [f"🏆 Top 10 Customers{' for ' + month if month else ''}:"]
+
+    for _, r in df.iterrows():
+        lines.append(f"{r['customer']} → {r['total_amount']:,.0f}")
+
+    return "\n".join(lines), {"top_customers": df.to_dict(orient="records")}, chart_url
+
+
+def sql_vendor_summary(conn: sqlite3.Connection, chart_type: str):
+    """
+    Vendor summary: invoices, payments, net balance.
+    Negative amounts = invoices, positive = payments.
+    """
+    q = """
+    SELECT
+        mserp_accountnum AS vendor,
+        SUM(CASE WHEN mserp_amountmst < 0 THEN -mserp_amountmst ELSE 0 END) AS invoices,
+        SUM(CASE WHEN mserp_amountmst > 0 THEN  mserp_amountmst ELSE 0 END) AS payments,
+        SUM(mserp_amountmst) AS net_balance
+    FROM vendtrans
+    GROUP BY mserp_accountnum
+    ORDER BY net_balance DESC;
+    """
+    df = pd.read_sql_query(q, conn)
+
+    labels = df["vendor"].tolist()
+    values = df["net_balance"].tolist()
+    chart_url = make_chart_url(chart_type, labels, values)
+
+    lines = ["📘 Vendor Summary (Invoices | Payments | Net Balance):"]
+    for _, r in df.iterrows():
+        lines.append(
+            f"{r['vendor']} → Invoices: {r['invoices']:,.0f}, "
+            f"Payments: {r['payments']:,.0f}, Net: {r['net_balance']:,.0f}"
+        )
+    text = "\n".join(lines)
+
+    tables = {"vendor_summary": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+def sql_balance_by_vendor(conn: sqlite3.Connection, chart_type: str):
+    """
+    Vendor net balance (sum of mserp_amountmst).
+    """
+    q = """
+    SELECT
+        mserp_accountnum AS vendor,
+        SUM(mserp_amountmst) AS net_balance
+    FROM vendtrans
+    GROUP BY mserp_accountnum
+    ORDER BY net_balance DESC;
+    """
+    df = pd.read_sql_query(q, conn)
+
+    labels = df["vendor"].tolist()
+    values = df["net_balance"].tolist()
+    chart_url = make_chart_url(chart_type, labels, values)
+
+    lines = ["💰 Vendor Net Balance (Positive = Payable, Negative = Credit):"]
+    for _, r in df.iterrows():
+        lines.append(f"{r['vendor']} → {r['net_balance']:,.0f}")
+    text = "\n".join(lines)
+
+    tables = {"balance_by_vendor": df.to_dict(orient="records")}
+    return text, tables, chart_url
+
+
+def sql_outstanding_vendor_wise(conn: sqlite3.Connection, chart_type: str):
+    """
+    Outstanding vendor-wise totals without aging buckets.
+    """
+    q = """
+    SELECT
+        mserp_accountnum AS vendor,
+        SUM(mserp_amountmst - mserp_settleamountmst) AS outstanding
+    FROM vendtrans
+    WHERE (mserp_amountmst - mserp_settleamountmst) > 0
+    GROUP BY mserp_accountnum
+    ORDER BY outstanding DESC;
+    """
+    df = pd.read_sql_query(q, conn)
+
+    labels = df["vendor"].tolist()
+    values = df["outstanding"].tolist()
+    chart_url = make_chart_url(chart_type, labels, values)
+
+    lines = ["🧾 Outstanding Vendor-wise Totals:"]
+    for _, r in df.iterrows():
+        lines.append(f"{r['vendor']} → {r['outstanding']:,.0f}")
+    text = "\n".join(lines)
+
+    tables = {"outstanding_vendor_wise": df.to_dict(orient="records")}
+    return text, tables, chart_url
+def format_millions(value: float) -> str:
+    if value >= 1_000_000:
+        return f"{value/1_000_000:.2f}M"
+    elif value >= 1_000:
+        return f"{value/1_000:.2f}K"
+    else:
+        return f"{value:.2f}"
+
+def summarize_business_output(query, scenario, month, df):
+    """
+    Business summary generator:
+    Converts raw table output into a clean CFO-level narrative.
+    """
+ 
+    # -----------------------------------------
+    # 1. SYSTEM PROMPT (UPDATED WITH • BULLETS)
+    # -----------------------------------------
+    system_msg = """
+You are a senior finance analyst.
+ 
+Write a VERY SHORT, professional CFO-level summary using ONLY bullet points.
+ 
+STRICT RULES:
+- Use ONLY this bullet style: •
+- Every bullet MUST be on its own line.
+- After each bullet, you MUST insert a newline (\\n) so bullets never appear in the same line.
+- Maximum 4–5 bullet points.
+- Do NOT write long paragraphs.
+- Do NOT repeat table values already shown above.
+- Do NOT mention SQL, JSON, rows, datasets, or 'table above'.
+- Use concise CFO-style financial language:
+  liquidity risk, cashflow pressure, exposure, payment gaps, deferred liabilities,
+  volatility, stabilization, spending spikes.
+ 
+FORMAT (must match exactly):
+ 
+• Insight 1  
+• Insight 2  
+• Insight 3  
+• Insight 4  
+• Insight 5 (optional)
+ 
+Each bullet must start with "• " at the beginning of a new line.
+Never place two bullets in the same line.
+Never combine multiple insights in one bullet.
+"""
+ 
+    # -----------------------------------------
+    # 2. Build HTML Trend Table (only for TREND)
+    # -----------------------------------------
+    trend_table = ""
+    if scenario == "trend" and df is not None and not df.empty:
+        trend_table = build_trend_html_table(df)
+ 
+    # -----------------------------------------
+    # 3. Prepare user payload
+    # -----------------------------------------
+    preview = df.to_dict(orient="records") if df is not None else []
+ 
+    payload = {
+        "query": query,
+        "scenario": scenario,
+        "month": month,
+        "trend_table": bool(trend_table),
+        "data_preview": preview
+    }
+ 
+    # -----------------------------------------
+    # 4. LLM CALL — Generate Summary
+    # -----------------------------------------
+    try:
+        resp = aoai_client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": json.dumps(payload)}
+            ],
+            max_tokens=250,
+            temperature=0,
+        )
+ 
+        summary = resp.choices[0].message.content.strip()
+ 
+        # -----------------------------------------
+        # 5. FINAL OUTPUT — attach HTML table
+        # -----------------------------------------
+ 
+        # 5A — trend uses trend HTML
+        if scenario == "trend" and trend_table:
+            return trend_table + summary
+ 
+        # 5B — all other scenarios use generic HTML
+        if df is not None and not df.empty:
+            generic_html = build_html_table_generic(preview)
+            return generic_html + summary
+ 
+        # fallback
+        return summary
+ 
+    except Exception as e:
+        logger.error("Business summary LLM error: %s", e)
+        return "Summary unavailable."
+
+# ------------------------------------------------------
+# FASTAPI APP
+# ------------------------------------------------------
+app = FastAPI(title="Payables Intelligence Engine (Dataverse + Azure OpenAI + SQLite)")
+
+# ------------------------------------------------------
+# STARTUP EVENT → Warm-up Dataverse + SQLite Cache
+# ------------------------------------------------------
+@app.on_event("startup")
+def warm_up_sqlite_cache():
+    """
+    Runs once when FastAPI server starts.
+    Preloads Dataverse tables → builds in-memory SQLite → stores cache.
+    This removes 1.5–2.5 seconds delay for the first request.
+    """
+    try:
+        logger.info("🚀 Warming up Dataverse → SQLite cache at startup...")
+        conn = build_sqlite_database_cached()
+
+        # simple ping to ensure DB is active
+        conn.execute("SELECT 1")
+        logger.info("✅ Warm-up complete! Cache is ready.")
 
     except Exception as e:
-        logger.error("❌ SQL Execution Failed!")
-        logger.error(str(e))
+        logger.error("❌ Warm-up failed: %s", e)
+
+
+
+class QueryRequest(BaseModel):
+    query: str
+
+@app.post("/llm/query")
+def llm_query(req: QueryRequest):
+    scenario, month_str = classify_with_llm(req.query)
+    logger.info("Detected scenario: %s, month: %s", scenario, month_str)
+
+    try:
+        conn = build_sqlite_database_cached()
+
+
+        chart_type = "bar"   # default
+
+        # ----------------- AGING -----------------
+        if scenario in ("aging", "aging_vendor"):
+            chart_type = "pie"
+            text, tables, chart_url = sql_aging_vendor(conn, chart_type)
+
+        # ----------------- TREND -------------------
+        elif scenario == "trend":
+            text, tables, chart_url = sql_trend(conn, chart_type)
+
+        # ---------------- EXPECTED (THIS WEEK) -----------------
+        elif scenario == "expected" and not month_str:
+            chart_type = "line"
+            text, tables, chart_url = sql_expected_payments(conn, chart_type)
+
+        # ---------------- EXPECTED (SPECIFIC MONTH) ------------
+        elif scenario == "expected_month" and month_str:
+            chart_type = "line"
+            text, tables, chart_url = sql_expected_payments_month(conn, chart_type, month_str)
+
+        # ------------- EXPECTED COMPANY (THIS WEEK) -----------
+        elif scenario == "expected_company" and not month_str:
+            chart_type = "line"
+            text, tables, chart_url = sql_expected_payments_by_company(conn, chart_type)
+
+        # ------------- EXPECTED COMPANY (SPECIFIC MONTH) ------
+        elif scenario == "expected_company_month" and month_str:
+            chart_type = "line"
+            text, tables, chart_url = sql_expected_payments_by_company_month(conn, chart_type, month_str)
+
+        # -------- OUTSTANDING MONTH LOGIC ----------
+        elif scenario == "outstanding_current":
+            text, tables, chart_url = sql_outstanding_this_month(conn, chart_type)
+
+        elif scenario == "outstanding_month" and month_str:
+            text, tables, chart_url = sql_outstanding_for_month(conn, month_str, chart_type)
+
+        # ------------ TOTAL PAYABLES ---------------
+        elif scenario == "total_payables_vendor":
+            text, tables, chart_url = sql_total_payables_vendor(conn, chart_type)
+
+        # -------------- TOP CUSTOMERS --------------
+        elif scenario == "top_customers":
+            # Month-aware
+            text, tables, chart_url = sql_top_customers(conn, chart_type, month_str)
+
+        # -------------- VENDOR SUMMARY -------------
+        elif scenario == "vendor_summary":
+            text, tables, chart_url = sql_vendor_summary(conn, chart_type)
+
+        # ------------ BALANCE BY VENDOR ------------
+        elif scenario == "balance_by_vendor":
+            text, tables, chart_url = sql_balance_by_vendor(conn, chart_type)
+
+        # -------- OUTSTANDING VENDOR-WISE ----------
+        elif scenario == "outstanding_vendor_wise":
+            text, tables, chart_url = sql_outstanding_vendor_wise(conn, chart_type)
+
+        else:
+            text = "Query not supported."
+            tables = {}
+            chart_url = None
+
+  
+
+       # Generate business-level summary
+        df_all = pd.DataFrame()
+        for tbl in tables.values():
+            df_all = pd.concat([df_all, pd.DataFrame(tbl)], ignore_index=True)
+
+        business_summary = summarize_business_output(
+            req.query, scenario, month_str, df_all
+        )
 
         return {
-            "error": str(e),
-            "sql_generated": sql_query,
+            "scenario": "payables",
+            "response": business_summary,
+            "tables": tables,
+            "chart_url": chart_url,
         }
 
 
-# =====================================================
-# New Payables Endpoints (Pandas-based)
-# =====================================================
-
-@app.get("/payables/overdue")
-def payables_overdue(base_date: str | None = None):
-    """
-    Overdue summary as of base_date (YYYY-MM-DD). If not provided, uses today's date (UTC).
-    """
-    if base_date:
-        base_dt = datetime.fromisoformat(base_date)
-    else:
-        base_dt = datetime.utcnow()
-
-    logger.info(f"🌐 /payables/overdue called with base_date={base_dt.date()}")
-
-    df = build_payables_base_df(base_dt)
-    summary = get_overdue_summary(df, base_dt)
-    return summary
-
-
-@app.get("/payables/weekly")
-def payables_weekly(base_date: str | None = None):
-    """
-    금주 지급예상액 (weekly expected payments) per company & day within the week of base_date.
-    base_date format: YYYY-MM-DD, default = today (UTC).
-    """
-    if base_date:
-        base_dt = datetime.fromisoformat(base_date)
-    else:
-        base_dt = datetime.utcnow()
-
-    logger.info(f"🌐 /payables/weekly called with base_date={base_dt.date()}")
-
-    df = build_payables_base_df(base_dt)
-    weekly_df = get_weekly_expected_payments(df, base_dt)
-    week_start, week_end = get_week_range(base_dt)
-    return {
-        "base_date": str(base_dt.date()),
-        "week_start": str(week_start),
-        "week_end": str(week_end),
-        "rows": len(weekly_df),
-        "data": weekly_df.to_dict(orient="records"),
-    }
-
-
-@app.get("/payables/aging/company")
-def payables_aging_company(base_date: str | None = None):
-    """
-    Company-wise aging summary:
-    CompanyCode / CompanyName / CompanyCurrency / Bucket / AmountMST
-    Buckets: OVERDUE, 0-30, 31-60, 61-90, 90+
-    """
-    if base_date:
-        base_dt = datetime.fromisoformat(base_date)
-    else:
-        base_dt = datetime.utcnow()
-
-    logger.info(f"🌐 /payables/aging/company called with base_date={base_dt.date()}")
-
-    df = build_payables_base_df(base_dt)
-    aging_df = get_company_aging_summary(df)
-    return {
-        "base_date": str(base_dt.date()),
-        "rows": len(aging_df),
-        "data": aging_df.to_dict(orient="records"),
-    }
+    except Exception as e:
+        logger.exception("Error during SQL execution")
+        raise HTTPException(status_code=500, detail=str(e))
