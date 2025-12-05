@@ -1,3 +1,6 @@
 venv/
 copilot/.env
 Info 1.txt
+__pycache__/
+copilot/payables_cache.db
+copilot/__pycache__
